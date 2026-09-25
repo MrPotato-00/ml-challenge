@@ -10,6 +10,7 @@ import math
 import re
 import sqlite3
 import tempfile
+import time
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
@@ -92,6 +93,8 @@ def encode_e5(frame: pd.DataFrame, tokenizer, model, batch_size: int, max_length
     import torch
 
     vectors = []
+    report_every = max(batch_size, math.ceil(len(frame) / 10))
+    next_report = report_every
     for start in range(0, len(frame), batch_size):
         part = frame.iloc[start:start + batch_size]
         texts = [
@@ -107,6 +110,10 @@ def encode_e5(frame: pd.DataFrame, tokenizer, model, batch_size: int, max_length
             pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1)
             pooled = torch.nn.functional.normalize(pooled.float(), dim=1)
         vectors.append(pooled.cpu().numpy())
+        done = start + len(part)
+        if len(frame) >= 20_000 and (done >= next_report or done == len(frame)):
+            print(f"E5 training-sample encoding {done:,}/{len(frame):,} ({done / len(frame):.0%})", flush=True)
+            next_report = done + report_every
     return np.ascontiguousarray(np.concatenate(vectors), dtype=np.float32)
 
 
@@ -121,18 +128,27 @@ def load_e5(model_name: str, batch_size: int, max_length: int):
     return lambda frame: encode_e5(frame, tokenizer, model, batch_size, max_length), model.config.hidden_size
 
 
-def build_country_index(target: pd.DataFrame, positions: np.ndarray, dimensions: int, encode_rows, batch_size: int) -> faiss.Index:
+def build_country_index(target: pd.DataFrame, positions: np.ndarray, dimensions: int, encode_rows, batch_size: int, label: str = "") -> faiss.Index:
+    started = time.monotonic()
     nlist = min(2048, max(32, int(math.sqrt(len(positions)))))
     if len(positions) < 20_000:
         index: faiss.Index = faiss.IndexIDMap2(faiss.IndexFlatIP(dimensions))
     else:
         index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dimensions), dimensions, nlist, faiss.METRIC_INNER_PRODUCT)
         sample = positions[np.linspace(0, len(positions) - 1, min(len(positions), nlist * 40), dtype=int)]
+        if label:
+            print(f"{label} training FAISS on {len(sample):,} rows", flush=True)
         index.train(encode_rows(target.iloc[sample]))
         index.nprobe = min(32, nlist)
+    report_every = max(batch_size, math.ceil(len(positions) / 10))
+    next_report = report_every
     for start in range(0, len(positions), batch_size):
         ids = positions[start:start + batch_size]
         index.add_with_ids(encode_rows(target.iloc[ids]), ids)
+        done = start + len(ids)
+        if label and (done >= next_report or done == len(positions)):
+            print(f"{label} indexed {done:,}/{len(positions):,} ({done / len(positions):.0%}) elapsed={time.monotonic() - started:.0f}s", flush=True)
+            next_report = done + report_every
     return index
 
 
@@ -141,6 +157,7 @@ def build_indexes(
     vectorizer: HashingVectorizer,
     svd: TruncatedSVD,
     batch_size: int,
+    label: str = "",
 ) -> dict[str, faiss.Index]:
     indexes: dict[str, faiss.Index] = {}
     dimensions = svd.n_components
@@ -149,6 +166,7 @@ def build_indexes(
         indexes[str(country)] = build_country_index(
             target, positions, dimensions,
             lambda rows: encode(rows["search_text"], vectorizer, svd), batch_size,
+            f"{label} CPU country={country}" if label else "",
         )
     return indexes
 
@@ -200,10 +218,13 @@ def candidates_for_source(
     batch_size: int,
     gpu_encoder=None,
     gpu_dimensions: int = 0,
+    progress_label: str = "",
 ):
     block_columns = ("name_norm", "name_core", "address_norm")
     # ponytail: skip keys shared by >100 targets; add address ranking if these blocks limit recall.
     exact_blocks = []
+    if progress_label:
+        print(f"{progress_label} building exact blocks", flush=True)
     for column in block_columns:
         wanted = set(zip(source1["country"], source1[column]))
         matches = defaultdict(list)
@@ -212,6 +233,8 @@ def candidates_for_source(
             if value and key in wanted and len(matches[key]) <= 100:
                 matches[key].append(right_id)
         exact_blocks.append(matches)
+    if progress_label:
+        print(f"{progress_label} exact blocks ready", flush=True)
     target_countries = target.groupby("country", sort=False).indices if gpu_encoder is not None else {}
     for country, positions in source1.groupby("country", sort=False).indices.items():
         index = indexes.get(str(country))
@@ -224,9 +247,11 @@ def candidates_for_source(
                 gpu_index = build_country_index(
                     target, np.asarray(right_positions, dtype=np.int64), gpu_dimensions,
                     gpu_encoder, batch_size,
+                    f"{progress_label} E5 country={country}" if progress_label else "",
                 )
-                print(f"gpu_indexed country={country} rows={len(right_positions):,}", flush=True)
         positions = np.asarray(positions, dtype=np.int64)
+        report_every = max(1, math.ceil(len(positions) / 10))
+        next_report = report_every
         for start in range(0, len(positions), batch_size):
             left_ids = positions[start:start + batch_size]
             scores, right_ids = index.search(
@@ -256,6 +281,10 @@ def candidates_for_source(
                     if gpu_encoder is not None:
                         features.extend((gpu_score, 1.0 / (gpu_rank + 1) if gpu_rank < top_k else 0.0))
                     yield int(left_id), str(right["entity_id"]), features
+                done = start + row_number + 1
+                if progress_label and (done >= next_report or done == len(positions)):
+                    print(f"{progress_label} country={country} scored {done:,}/{len(positions):,} S1 rows ({done / len(positions):.0%})", flush=True)
+                    next_report = done + report_every
         del gpu_index
 
 
@@ -286,13 +315,21 @@ def train(args: argparse.Namespace) -> None:
     train_dir = args.data_dir / "train"
     source_paths = [train_dir / f"train_source{i}.tsv" for i in (1, 2, 3)]
     # The unlabeled test sample exposes unseen countries to the retrieval encoder.
+    print("stage=fit_cpu_encoder started", flush=True)
     vectorizer, svd = fit_encoder(
         source_paths + [args.data_dir / "test" / "test_source1.tsv"],
         args.encoder_rows, args.dimensions,
     )
+    print("stage=fit_cpu_encoder done", flush=True)
+    print("stage=read_source1 started", flush=True)
     source1 = read_tsv(source_paths[0], args.max_s1)
     truth = load_truth(train_dir / "train_ground_truth.tsv", set(source1["entity_id"]))
+    print(f"stage=read_source1 done rows={len(source1):,} true_links={sum(map(len, truth.values())):,}", flush=True)
+    if args.retriever == "hybrid":
+        print(f"stage=load_e5 model={args.e5_model}", flush=True)
     gpu_encoder, gpu_dimensions = load_e5(args.e5_model, args.gpu_batch_size, args.max_length) if args.retriever == "hybrid" else (None, 0)
+    if gpu_encoder is not None:
+        print("stage=load_e5 done", flush=True)
 
     train_x: list[list[float]] = []
     train_y: list[int] = []
@@ -300,11 +337,13 @@ def train(args: argparse.Namespace) -> None:
     retrieved: dict[str, set[str]] = {entity_id: set() for entity_id in source1["entity_id"]}
 
     for path in source_paths[1:]:
+        print(f"source={path.stem} stage=read_target started", flush=True)
         target = read_tsv(path, args.max_target)
-        indexes = build_indexes(target, vectorizer, svd, args.batch_size)
+        print(f"source={path.stem} stage=read_target done rows={len(target):,}", flush=True)
+        indexes = build_indexes(target, vectorizer, svd, args.batch_size, path.stem)
         for left_pos, candidate_id, features in candidates_for_source(
             source1, target, indexes, vectorizer, svd, args.top_k, args.batch_size,
-            gpu_encoder, gpu_dimensions,
+            gpu_encoder, gpu_dimensions, path.stem,
         ):
             source1_id = str(source1.iloc[left_pos]["entity_id"])
             retrieved[source1_id].add(candidate_id)
@@ -314,10 +353,12 @@ def train(args: argparse.Namespace) -> None:
                 train_y.append(label)
             else:
                 held_out.setdefault(source1_id, []).append((candidate_id, features))
+        print(f"source={path.stem} stage=candidates done", flush=True)
         del indexes, target
 
     if not train_y or len(set(train_y)) < 2:
         raise RuntimeError("Training candidates contain only one class; raise --top-k or data limits")
+    print(f"stage=fit_classifier started training_pairs={len(train_y):,} positives={sum(train_y):,}", flush=True)
     model = HistGradientBoostingClassifier(
         learning_rate=0.06, max_iter=150, max_leaf_nodes=15,
         min_samples_leaf=30, l2_regularization=2.0, early_stopping=False, random_state=42,
@@ -325,6 +366,7 @@ def train(args: argparse.Namespace) -> None:
         np.asarray(train_x, dtype=np.float32), np.asarray(train_y, dtype=np.uint8),
         sample_weight=np.where(np.asarray(train_y) == 1, 5.0, 1.0),
     )
+    print("stage=fit_classifier done; calibrating threshold", flush=True)
 
     scored: dict[str, list[tuple[str, float]]] = {}
     for source1_id, rows in held_out.items():

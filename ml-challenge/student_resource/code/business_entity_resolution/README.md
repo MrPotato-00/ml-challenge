@@ -109,3 +109,6 @@ The command reports union candidate recall and independent held-out macro
 F0.5; compare both with 59.56% and 0.7141 from the CPU run. This is a sampled
 validation run, not a submission. The hybrid model records its retriever and
 model path in the saved artifact so prediction uses the same candidate method.
+Training prints flushed stage messages plus per-country indexing and S1 scoring
+percentages. These messages require starting a new run with the updated code;
+they cannot appear in a training process that was already running.
