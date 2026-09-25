@@ -261,3 +261,11 @@ classifier. The immediate Kaggle experiment is the same 2,000-S1/full-target
 split at top 50; measure union recall and independent held-out macro F0.5
 before predicting test rows. This code has CPU-side checks but has not yet
 completed a Kaggle GPU hybrid run. See the package README for the command.
+
+Organizer update: `candidate_pairs.tsv` is part of the final submission, and
+smaller candidate sets count toward final ranking beyond the matching-score
+leaderboards. The current hybrid union may be large: at top 50 it can contribute
+up to 50 CPU and 50 E5 results per target source, plus exact-block candidates.
+Before fixing a candidate budget, measure average and tail candidates per S1,
+true-link recall at smaller top-k values, and held-out F0.5. Candidate pruning
+must happen before the matching model so the TSV remains the exact scored set.

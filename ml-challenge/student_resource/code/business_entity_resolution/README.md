@@ -105,8 +105,9 @@ python code/business_entity_resolution/src/pipeline.py train \
 
 Do not set `--max-target` for this comparison. Keep a Kaggle GPU enabled and
 Internet on for the E5 weights, or pass `--e5-model PATH` for an attached copy.
-The command reports union candidate recall and independent held-out macro
-F0.5; compare both with 59.56% and 0.7141 from the CPU run. This is a sampled
+The command reports union candidate recall, mean/p95/max candidates per S1,
+and independent held-out macro F0.5; compare recall and F0.5 with 59.56% and
+0.7141 from the CPU run. This is a sampled
 validation run, not a submission. The hybrid model records its retriever and
 model path in the saved artifact so prediction uses the same candidate method.
 Training prints flushed stage messages plus per-country indexing and S1 scoring

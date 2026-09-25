@@ -391,6 +391,7 @@ def train(args: argparse.Namespace) -> None:
     ]))
     positives = sum(len(v) for v in truth.values())
     hits = sum(len(truth.get(k, set()) & v) for k, v in retrieved.items())
+    candidate_sizes = np.fromiter((len(ids) for ids in retrieved.values()), dtype=np.int32, count=len(retrieved))
 
     args.model.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({
@@ -401,6 +402,7 @@ def train(args: argparse.Namespace) -> None:
     }, args.model)
     print(f"trained_pairs={len(train_y):,} positive_pairs={sum(train_y):,}")
     print(f"candidate_recall={hits / positives:.4f} ({hits:,}/{positives:,})")
+    print(f"candidates_per_s1 mean={candidate_sizes.mean():.1f} p95={np.percentile(candidate_sizes, 95):.0f} max={candidate_sizes.max()}")
     print(f"calibration_macro_f0.5={results[best]:.4f} threshold={threshold:.2f}")
     print(f"held_out_macro_f0.5={evaluation_score:.4f} entities={len(evaluation_ids):,}")
     print(f"saved={args.model}")

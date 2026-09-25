@@ -106,8 +106,11 @@ several blocking/filtering stages, `candidate_pairs.tsv` is the *last* one: what
 your model actually runs inference over. Every ID in `matching_results.tsv` should
 therefore appear here.
 
-It is **not scored on the leaderboard**; we use it to analyse blocking quality (recall
-ceiling, reduction ratio) and to verify your pipeline.
+An organizer update says `candidate_pairs.tsv` is part of the final submission
+and candidate-generation efficiency counts toward final ranking beyond the
+public/private matching-score leaderboards. Keep this pre-model candidate set
+small while measuring how much true-match recall each reduction costs. The
+update does not specify a numeric candidate cap or scoring formula.
 
 | Column | Description |
 | --- | --- |
