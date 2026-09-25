@@ -88,6 +88,54 @@ def encode(texts: list[str] | pd.Series, vectorizer: HashingVectorizer, svd: Tru
     return l2_normalize(vectors, copy=False)
 
 
+def encode_e5(frame: pd.DataFrame, tokenizer, model, batch_size: int, max_length: int) -> np.ndarray:
+    import torch
+
+    vectors = []
+    for start in range(0, len(frame), batch_size):
+        part = frame.iloc[start:start + batch_size]
+        texts = [
+            f"query: business name: {name}; address: {address}"
+            for name, address in zip(part["name_norm"], part["address_norm"])
+        ]
+        inputs = tokenizer(
+            texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt"
+        ).to("cuda")
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            hidden = model(**inputs).last_hidden_state
+            mask = inputs["attention_mask"].unsqueeze(-1)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1)
+            pooled = torch.nn.functional.normalize(pooled.float(), dim=1)
+        vectors.append(pooled.cpu().numpy())
+    return np.ascontiguousarray(np.concatenate(vectors), dtype=np.float32)
+
+
+def load_e5(model_name: str, batch_size: int, max_length: int):
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Hybrid retrieval requires a CUDA GPU")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name).to("cuda").eval()
+    return lambda frame: encode_e5(frame, tokenizer, model, batch_size, max_length), model.config.hidden_size
+
+
+def build_country_index(target: pd.DataFrame, positions: np.ndarray, dimensions: int, encode_rows, batch_size: int) -> faiss.Index:
+    nlist = min(2048, max(32, int(math.sqrt(len(positions)))))
+    if len(positions) < 20_000:
+        index: faiss.Index = faiss.IndexIDMap2(faiss.IndexFlatIP(dimensions))
+    else:
+        index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dimensions), dimensions, nlist, faiss.METRIC_INNER_PRODUCT)
+        sample = positions[np.linspace(0, len(positions) - 1, min(len(positions), nlist * 40), dtype=int)]
+        index.train(encode_rows(target.iloc[sample]))
+        index.nprobe = min(32, nlist)
+    for start in range(0, len(positions), batch_size):
+        ids = positions[start:start + batch_size]
+        index.add_with_ids(encode_rows(target.iloc[ids]), ids)
+    return index
+
+
 def build_indexes(
     target: pd.DataFrame,
     vectorizer: HashingVectorizer,
@@ -98,18 +146,10 @@ def build_indexes(
     dimensions = svd.n_components
     for country, positions in target.groupby("country", sort=False).indices.items():
         positions = np.asarray(positions, dtype=np.int64)
-        nlist = min(2048, max(32, int(math.sqrt(len(positions)))))
-        if len(positions) < 20_000:
-            index: faiss.Index = faiss.IndexIDMap2(faiss.IndexFlatIP(dimensions))
-        else:
-            index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dimensions), dimensions, nlist, faiss.METRIC_INNER_PRODUCT)
-            sample = positions[np.linspace(0, len(positions) - 1, min(len(positions), nlist * 40), dtype=int)]
-            index.train(encode(target.iloc[sample]["search_text"], vectorizer, svd))
-            index.nprobe = min(32, nlist)
-        for start in range(0, len(positions), batch_size):
-            ids = positions[start:start + batch_size]
-            index.add_with_ids(encode(target.iloc[ids]["search_text"], vectorizer, svd), ids)
-        indexes[str(country)] = index
+        indexes[str(country)] = build_country_index(
+            target, positions, dimensions,
+            lambda rows: encode(rows["search_text"], vectorizer, svd), batch_size,
+        )
     return indexes
 
 
@@ -158,6 +198,8 @@ def candidates_for_source(
     svd: TruncatedSVD,
     top_k: int,
     batch_size: int,
+    gpu_encoder=None,
+    gpu_dimensions: int = 0,
 ):
     block_columns = ("name_norm", "name_core", "address_norm")
     # ponytail: skip keys shared by >100 targets; add address ranking if these blocks limit recall.
@@ -170,30 +212,51 @@ def candidates_for_source(
             if value and key in wanted and len(matches[key]) <= 100:
                 matches[key].append(right_id)
         exact_blocks.append(matches)
+    target_countries = target.groupby("country", sort=False).indices if gpu_encoder is not None else {}
     for country, positions in source1.groupby("country", sort=False).indices.items():
         index = indexes.get(str(country))
         if index is None:
             continue
+        gpu_index = None
+        if gpu_encoder is not None:
+            right_positions = target_countries.get(country)
+            if right_positions is not None:
+                gpu_index = build_country_index(
+                    target, np.asarray(right_positions, dtype=np.int64), gpu_dimensions,
+                    gpu_encoder, batch_size,
+                )
+                print(f"gpu_indexed country={country} rows={len(right_positions):,}", flush=True)
         positions = np.asarray(positions, dtype=np.int64)
         for start in range(0, len(positions), batch_size):
             left_ids = positions[start:start + batch_size]
             scores, right_ids = index.search(
                 encode(source1.iloc[left_ids]["search_text"], vectorizer, svd), top_k
             )
+            if gpu_index is not None:
+                gpu_scores, gpu_right_ids = gpu_index.search(gpu_encoder(source1.iloc[left_ids]), top_k)
             for row_number, left_id in enumerate(left_ids):
                 left = source1.iloc[left_id]
                 candidates = {
-                    int(right_id): (float(score), rank)
+                    int(right_id): (float(score), rank, 0.0, top_k)
                     for rank, (right_id, score) in enumerate(zip(right_ids[row_number], scores[row_number]))
                     if right_id >= 0
                 }
+                if gpu_index is not None:
+                    for rank, (right_id, score) in enumerate(zip(gpu_right_ids[row_number], gpu_scores[row_number])):
+                        if right_id >= 0:
+                            cpu_score, cpu_rank, _, _ = candidates.get(int(right_id), (0.0, top_k, 0.0, top_k))
+                            candidates[int(right_id)] = (cpu_score, cpu_rank, float(score), rank)
                 for column, matches in zip(block_columns, exact_blocks):
                     block = matches.get((country, left[column]), ())
                     for right_id in block if len(block) <= 100 else ():
-                        candidates.setdefault(right_id, (0.0, top_k))
-                for right_id, (score, rank) in candidates.items():
+                        candidates.setdefault(right_id, (0.0, top_k, 0.0, top_k))
+                for right_id, (score, rank, gpu_score, gpu_rank) in candidates.items():
                     right = target.iloc[right_id]
-                    yield int(left_id), str(right["entity_id"]), pair_features(left, right, score, rank)
+                    features = pair_features(left, right, score, rank)
+                    if gpu_encoder is not None:
+                        features.extend((gpu_score, 1.0 / (gpu_rank + 1) if gpu_rank < top_k else 0.0))
+                    yield int(left_id), str(right["entity_id"]), features
+        del gpu_index
 
 
 def load_truth(path: Path, allowed: set[str]) -> dict[str, set[str]]:
@@ -229,6 +292,7 @@ def train(args: argparse.Namespace) -> None:
     )
     source1 = read_tsv(source_paths[0], args.max_s1)
     truth = load_truth(train_dir / "train_ground_truth.tsv", set(source1["entity_id"]))
+    gpu_encoder, gpu_dimensions = load_e5(args.e5_model, args.gpu_batch_size, args.max_length) if args.retriever == "hybrid" else (None, 0)
 
     train_x: list[list[float]] = []
     train_y: list[int] = []
@@ -239,7 +303,8 @@ def train(args: argparse.Namespace) -> None:
         target = read_tsv(path, args.max_target)
         indexes = build_indexes(target, vectorizer, svd, args.batch_size)
         for left_pos, candidate_id, features in candidates_for_source(
-            source1, target, indexes, vectorizer, svd, args.top_k, args.batch_size
+            source1, target, indexes, vectorizer, svd, args.top_k, args.batch_size,
+            gpu_encoder, gpu_dimensions,
         ):
             source1_id = str(source1.iloc[left_pos]["entity_id"])
             retrieved[source1_id].add(candidate_id)
@@ -289,6 +354,8 @@ def train(args: argparse.Namespace) -> None:
     joblib.dump({
         "vectorizer": vectorizer, "svd": svd, "model": model,
         "threshold": threshold, "top_k": args.top_k,
+        "retriever": args.retriever, "e5_model": args.e5_model,
+        "max_length": args.max_length,
     }, args.model)
     print(f"trained_pairs={len(train_y):,} positive_pairs={sum(train_y):,}")
     print(f"candidate_recall={hits / positives:.4f} ({hits:,}/{positives:,})")
@@ -303,6 +370,8 @@ def write_source_predictions(
     target_path: Path,
     artifact: dict,
     args: argparse.Namespace,
+    gpu_encoder=None,
+    gpu_dimensions: int = 0,
 ) -> None:
     target = read_tsv(target_path, args.max_target)
     indexes = build_indexes(target, artifact["vectorizer"], artifact["svd"], args.batch_size)
@@ -332,7 +401,7 @@ def write_source_predictions(
     last_pos = None
     for left_pos, candidate_id, features in candidates_for_source(
         source1, target, indexes, artifact["vectorizer"], artifact["svd"],
-        artifact["top_k"], args.batch_size,
+        artifact["top_k"], args.batch_size, gpu_encoder, gpu_dimensions,
     ):
         if pending and left_pos != last_pos and len(pending) >= args.batch_size:
             score_pending()
@@ -352,6 +421,9 @@ def write_source_predictions(
 
 def predict(args: argparse.Namespace) -> None:
     artifact = joblib.load(args.model)
+    gpu_encoder, gpu_dimensions = load_e5(
+        artifact["e5_model"], args.gpu_batch_size, artifact.get("max_length", args.max_length)
+    ) if artifact.get("retriever") == "hybrid" else (None, 0)
     test_dir = args.data_dir / "test"
     source1 = read_tsv(test_dir / "test_source1.tsv", args.max_s1)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -359,7 +431,10 @@ def predict(args: argparse.Namespace) -> None:
         partials = []
         for source in (2, 3):
             partial = Path(tmp) / f"source{source}.tsv"
-            write_source_predictions(partial, source1, test_dir / f"test_source{source}.tsv", artifact, args)
+            write_source_predictions(
+                partial, source1, test_dir / f"test_source{source}.tsv", artifact, args,
+                gpu_encoder, gpu_dimensions,
+            )
             partials.append(partial)
         with (
             partials[0].open(encoding="utf-8", newline="") as left,
@@ -386,12 +461,16 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--max-s1", type=int)
     common.add_argument("--max-target", type=int)
     common.add_argument("--batch-size", type=int, default=4096)
+    common.add_argument("--gpu-batch-size", type=int, default=256)
+    common.add_argument("--max-length", type=int, default=128)
     command = argparse.ArgumentParser(description=__doc__)
     sub = command.add_subparsers(dest="command", required=True)
     training = sub.add_parser("train", parents=[common])
     training.add_argument("--encoder-rows", type=int, default=50_000)
     training.add_argument("--dimensions", type=int, default=64)
     training.add_argument("--top-k", type=int, default=10)
+    training.add_argument("--retriever", choices=("cpu", "hybrid"), default="cpu")
+    training.add_argument("--e5-model", default="intfloat/multilingual-e5-small")
     training.set_defaults(run=train)
     inference = sub.add_parser("predict", parents=[common])
     inference.add_argument("--output-dir", type=Path, default=root / "output")

@@ -249,8 +249,15 @@ code/business_entity_resolution/README.md
 
 ## Next step
 
-Candidate recall is still the main limit at about 60% with top 50 and exact
-blocks. The next experiment is `src/kaggle_gpu_probe.py`, a Kaggle GPU retrieval
-probe using an MIT-licensed multilingual embedding model. It reports target
-coverage and candidate recall; it does not change the production matcher.
-Only integrate its candidates if the full-target training probe shows a gain.
+The Kaggle GPU probe with multilingual-e5-small, 2,000 S1 rows, top 50, and
+both complete S2/S3 training files reached 5,758/6,986 = 0.8242 candidate
+recall at 100% target coverage. The comparable CPU pipeline achieved
+4,161/6,986 = 0.5956. This is retrieval-only evidence, not a held-out final
+matching score.
+
+`pipeline.py train --retriever hybrid` now unions CPU, E5, and exact-block
+candidates, adds E5 similarity/rank features, and retrains the existing
+classifier. The immediate Kaggle experiment is the same 2,000-S1/full-target
+split at top 50; measure union recall and independent held-out macro F0.5
+before predicting test rows. This code has CPU-side checks but has not yet
+completed a Kaggle GPU hybrid run. See the package README for the command.

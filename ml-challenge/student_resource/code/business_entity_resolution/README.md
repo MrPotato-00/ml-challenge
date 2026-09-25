@@ -86,3 +86,26 @@ For a short smoke run, add `--max-target 100000`; judge that run by
 run omits `--max-target` and processes both complete training target files.
 Run `python code/business_entity_resolution/src/kaggle_gpu_probe.py --self-test`
 to check its local FAISS ID mapping without a GPU.
+
+## Hybrid CPU + GPU validation
+
+The full-target GPU probe retrieved 5,758/6,986 true links (82.42%) on the
+first 2,000 training S1 rows, versus 4,161/6,986 (59.56%) for the CPU
+pipeline. This is candidate recall, **not** final matching F0.5. The next
+experiment unions CPU, E5, and exact-block candidates and retrains the pair
+classifier on that union:
+
+```bash
+pip install -r code/business_entity_resolution/requirements.txt 'transformers==4.57.6'
+python code/business_entity_resolution/src/pipeline.py train \
+  --data-dir /kaggle/input/YOUR-DATASET/dataset \
+  --max-s1 2000 --top-k 50 --retriever hybrid \
+  --model artifacts/hybrid.joblib
+```
+
+Do not set `--max-target` for this comparison. Keep a Kaggle GPU enabled and
+Internet on for the E5 weights, or pass `--e5-model PATH` for an attached copy.
+The command reports union candidate recall and independent held-out macro
+F0.5; compare both with 59.56% and 0.7141 from the CPU run. This is a sampled
+validation run, not a submission. The hybrid model records its retriever and
+model path in the saved artifact so prediction uses the same candidate method.
