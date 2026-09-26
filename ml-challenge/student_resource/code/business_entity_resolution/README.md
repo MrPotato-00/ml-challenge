@@ -113,3 +113,5 @@ model path in the saved artifact so prediction uses the same candidate method.
 Training prints flushed stage messages plus per-country indexing and S1 scoring
 percentages. These messages require starting a new run with the updated code;
 they cannot appear in a training process that was already running.
+Prediction prints the same index/scoring progress for each test target source,
+then output-writing progress. An already-running prediction cannot gain these logs.

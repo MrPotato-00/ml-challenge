@@ -417,8 +417,10 @@ def write_source_predictions(
     gpu_encoder=None,
     gpu_dimensions: int = 0,
 ) -> None:
+    print(f"source={target_path.stem} stage=read_target started", flush=True)
     target = read_tsv(target_path, args.max_target)
-    indexes = build_indexes(target, artifact["vectorizer"], artifact["svd"], args.batch_size)
+    print(f"source={target_path.stem} stage=read_target done rows={len(target):,}", flush=True)
+    indexes = build_indexes(target, artifact["vectorizer"], artifact["svd"], args.batch_size, target_path.stem)
     database = sqlite3.connect(path.with_suffix(".db"))
     database.execute("PRAGMA journal_mode=OFF")
     database.execute("CREATE TABLE predictions (pos INTEGER PRIMARY KEY, candidates TEXT, matches TEXT)")
@@ -445,13 +447,14 @@ def write_source_predictions(
     last_pos = None
     for left_pos, candidate_id, features in candidates_for_source(
         source1, target, indexes, artifact["vectorizer"], artifact["svd"],
-        artifact["top_k"], args.batch_size, gpu_encoder, gpu_dimensions,
+        artifact["top_k"], args.batch_size, gpu_encoder, gpu_dimensions, target_path.stem,
     ):
         if pending and left_pos != last_pos and len(pending) >= args.batch_size:
             score_pending()
         pending.append((left_pos, candidate_id, features))
         last_pos = left_pos
     score_pending()
+    print(f"source={target_path.stem} stage=write_partial started", flush=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         stored = iter(database.execute("SELECT pos, candidates, matches FROM predictions ORDER BY pos"))
@@ -461,15 +464,21 @@ def write_source_predictions(
             if row and row[0] == pos:
                 row = next(stored, None)
     database.close()
+    print(f"source={target_path.stem} stage=write_partial done", flush=True)
 
 
 def predict(args: argparse.Namespace) -> None:
+    print(f"stage=load_artifact model={args.model}", flush=True)
     artifact = joblib.load(args.model)
+    if artifact.get("retriever") == "hybrid":
+        print(f"stage=load_e5 model={artifact['e5_model']}", flush=True)
     gpu_encoder, gpu_dimensions = load_e5(
         artifact["e5_model"], args.gpu_batch_size, artifact.get("max_length", args.max_length)
     ) if artifact.get("retriever") == "hybrid" else (None, 0)
+    print("stage=read_source1 started", flush=True)
     test_dir = args.data_dir / "test"
     source1 = read_tsv(test_dir / "test_source1.tsv", args.max_s1)
+    print(f"stage=read_source1 done rows={len(source1):,}", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="er-predictions-") as tmp:
         partials = []
@@ -490,9 +499,12 @@ def predict(args: argparse.Namespace) -> None:
             candidate_writer, match_writer = csv.writer(candidate_file, delimiter="\t", lineterminator="\n"), csv.writer(match_file, delimiter="\t", lineterminator="\n")
             candidate_writer.writerow(["source1_entity_id", "candidate_entity_ids"])
             match_writer.writerow(["source1_entity_id", "matched_entity_ids"])
-            for entity_id, a, b in zip(source1["entity_id"], *readers, strict=True):
+            print("stage=merge_outputs started", flush=True)
+            for row_number, (entity_id, a, b) in enumerate(zip(source1["entity_id"], *readers, strict=True), 1):
                 candidate_writer.writerow([entity_id, ",".join(filter(None, (a[0], b[0])))])
                 match_writer.writerow([entity_id, ",".join(filter(None, (a[1], b[1])))])
+                if row_number % max(1, len(source1) // 10) == 0 or row_number == len(source1):
+                    print(f"stage=merge_outputs rows={row_number:,}/{len(source1):,} ({row_number / len(source1):.0%})", flush=True)
     print(f"wrote={args.output_dir / 'candidate_pairs.tsv'}")
     print(f"wrote={args.output_dir / 'matching_results.tsv'}")
 
